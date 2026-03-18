@@ -14,8 +14,11 @@ def _validate_vocab_size(vocab_size: int, num_special_tokens: int) -> None:
         )
 
 
-def _init_base_vocab() -> dict[int, bytes]:
-    return {i: bytes([i]) for i in range(256)}
+def _init_base_vocab(special_tokens: list[str]) -> dict[int, bytes]:
+    vocab = {i: token.encode("utf-8") for i, token in enumerate(special_tokens)}
+    for i in range(256):
+        vocab[len(special_tokens) + i] = bytes([i])
+    return vocab
 
 
 def _load_corpus(input_path: str | os.PathLike) -> str:
@@ -37,6 +40,17 @@ def _count_pretokens(chunks: list[str]) -> dict[str, int]:
             token = match.group()
             pretoken_counts[token] = pretoken_counts.get(token, 0) + 1
     return pretoken_counts
+
+
+class _RevBytes:
+    __slots__ = ("b",)
+    def __init__(self, b: bytes): self.b = b
+    def __lt__(self, other): return self.b > other.b # 不管 bytes 长度如何，整个比较逻辑完全反转，没有副作用。
+    def __eq__(self, other): return self.b == other.b
+
+
+def _heap_entry(freq: int, pair: tuple[bytes, bytes]) -> tuple:
+    return (-freq, _RevBytes(pair[0]), _RevBytes(pair[1]), pair)
 
 
 def _compute_bpe_merges(                                                                                                                                                                                                                          
@@ -65,7 +79,7 @@ def _compute_bpe_merges(
 
     # 最大堆（负频次模拟），元素: (-freq, pair)
     # 同频时堆按 pair 字典序最小弹出（确定性即可），O(log n)
-    heap: list = [(-freq, pair) for pair, freq in pair_freq.items()]
+    heap: list = [_heap_entry(freq, pair) for pair, freq in pair_freq.items()]
     heapq.heapify(heap)
 
     # pair_freq  →  权威数据源（始终是最新频次）
@@ -74,7 +88,7 @@ def _compute_bpe_merges(
         # 弹出最优 pair，跳过过期条目（lazy deletion）
         best_pair = None
         while heap:
-            neg_freq, candidate = heapq.heappop(heap)
+            neg_freq, _, _, candidate = heapq.heappop(heap)
             if pair_freq.get(candidate, 0) == -neg_freq and -neg_freq > 0:
                 best_pair = candidate
                 break
@@ -107,14 +121,18 @@ def _compute_bpe_merges(
                         left = new_seq[-1]
                         pair_freq[(left, best_pair[0])] -= count
                         pair_freq[(left, new_token)] += count
-                        heapq.heappush(heap, (-pair_freq[(left, new_token)], (left, new_token)))
+                        heapq.heappush(heap, _heap_entry(pair_freq[(left, new_token)], (left, new_token)))
+                        # 当减少某个 pair 的频次时，必须推入新的记录，否则堆里只有旧的（过高的）频次。
+                        # lazy deletion 会丢弃旧条目，但新的正确频次从未入堆，这个 pair 就永远消失
+                        heapq.heappush(heap, _heap_entry(pair_freq[(left, best_pair[0])], (left, best_pair[0]))) 
 
                     # 更新右邻居：(b, right) → (ab, right)
                     if i + 2 < len(seq):
                         right = seq[i + 2]
                         pair_freq[(best_pair[1], right)] -= count
                         pair_freq[(new_token, right)] += count
-                        heapq.heappush(heap, (-pair_freq[(new_token, right)], (new_token, right)))
+                        heapq.heappush(heap, _heap_entry(pair_freq[(new_token, right)], (new_token, right)))
+                        heapq.heappush(heap, _heap_entry(pair_freq[(best_pair[1], right)], (best_pair[1], right)))  
 
                     new_seq.append(new_token)
                     i += 2
@@ -137,14 +155,11 @@ def train_bpe(
 
     _validate_vocab_size(vocab_size, len(special_tokens))
 
-    vocab = _init_base_vocab()
+    vocab = _init_base_vocab(special_tokens)
     corpus = _load_corpus(input_path)
     chunks = _split_by_special_tokens(corpus, special_tokens)
     pretoken_counts = _count_pretokens(chunks)
     merges = _compute_bpe_merges(pretoken_counts, vocab, vocab_size-len(special_tokens)-256)
-
-    for token in special_tokens:
-        vocab[max(vocab) + 1] = token.encode("utf-8")
 
     return vocab, merges
 
