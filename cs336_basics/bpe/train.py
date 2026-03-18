@@ -1,8 +1,6 @@
 import os
-import regex as re
-
-# GPT-2 style pre-tokenization pattern
-GPT2_PRETOK_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+from multiprocessing import Pool
+from cs336_basics.bpe.pretokenization import _find_chunk_boundaries, _count_file_chunk
 
 
 def _validate_vocab_size(vocab_size: int, num_special_tokens: int) -> None:
@@ -19,27 +17,6 @@ def _init_base_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     for i in range(256):
         vocab[len(special_tokens) + i] = bytes([i])
     return vocab
-
-
-def _load_corpus(input_path: str | os.PathLike) -> str:
-    with open(input_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def _split_by_special_tokens(corpus: str, special_tokens: list[str]) -> list[str]:
-    if not special_tokens:
-        return [corpus]
-    special_pattern = "|".join(map(re.escape, special_tokens))
-    return re.split(special_pattern, corpus)
-
-
-def _count_pretokens(chunks: list[str]) -> dict[str, int]:
-    pretoken_counts: dict[str, int] = {}
-    for chunk in chunks:
-        for match in re.finditer(GPT2_PRETOK_PATTERN, chunk):
-            token = match.group()
-            pretoken_counts[token] = pretoken_counts.get(token, 0) + 1
-    return pretoken_counts
 
 
 class _RevBytes:
@@ -147,6 +124,7 @@ def _compute_bpe_merges(
 
     return merges
 
+
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -156,9 +134,24 @@ def train_bpe(
     _validate_vocab_size(vocab_size, len(special_tokens))
 
     vocab = _init_base_vocab(special_tokens)
-    corpus = _load_corpus(input_path)
-    chunks = _split_by_special_tokens(corpus, special_tokens)
-    pretoken_counts = _count_pretokens(chunks)
+
+    num_processes = os.cpu_count() or 1
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+    with open(input_path, "rb") as f:
+        boundaries = _find_chunk_boundaries(f, num_processes, split_token)
+
+    args = [
+        (input_path, start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+    with Pool(processes=num_processes) as pool:
+        partial_counts = pool.map(_count_file_chunk, args)
+
+    pretoken_counts: dict[str, int] = {}
+    for counts in partial_counts:
+        for token, count in counts.items():
+            pretoken_counts[token] = pretoken_counts.get(token, 0) + count
+
     merges = _compute_bpe_merges(pretoken_counts, vocab, vocab_size-len(special_tokens)-256)
 
     return vocab, merges
