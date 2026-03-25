@@ -1,6 +1,11 @@
 import os
+from datetime import datetime
 from multiprocessing import Pool
 from cs336_basics.bpe.pretokenization import _find_chunk_boundaries, _count_file_chunk
+
+
+def _log(msg: str):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 
 def _validate_vocab_size(vocab_size: int, num_special_tokens: int) -> None:
@@ -61,7 +66,7 @@ def _compute_bpe_merges(
 
     # pair_freq  →  权威数据源（始终是最新频次）
     # heap       →  加速查找用的索引（可能有过期条目）
-    for _ in range(merge_times):
+    for i in range(merge_times):
         # 弹出最优 pair，跳过过期条目（lazy deletion）
         best_pair = None
         while heap:
@@ -72,6 +77,9 @@ def _compute_bpe_merges(
 
         if best_pair is None:
             break
+
+        if (i + 1) % 100 == 0:
+            _log(f"Merge {i + 1}/{merge_times}: best_pair={best_pair}, freq={-neg_freq}")
 
         merges.append(best_pair)
         new_token = best_pair[0] + best_pair[1]
@@ -132,13 +140,16 @@ def train_bpe(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
 
     _validate_vocab_size(vocab_size, len(special_tokens))
+    _log("Vocab size validated.")
 
     vocab = _init_base_vocab(special_tokens)
+    _log(f"Base vocab initialized with {len(vocab)} tokens.")
 
     num_processes = os.cpu_count() or 1
     split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
     with open(input_path, "rb") as f:
         boundaries = _find_chunk_boundaries(f, num_processes, split_token)
+    _log(f"Chunk boundaries found. Split file into {len(boundaries)-1} chunks.")
 
     args = [
         (input_path, start, end, special_tokens)
@@ -146,13 +157,18 @@ def train_bpe(
     ]
     with Pool(processes=num_processes) as pool:
         partial_counts = pool.map(_count_file_chunk, args)
+    _log("Parallel counting of tokens completed.")
 
     pretoken_counts: dict[str, int] = {}
     for counts in partial_counts:
         for token, count in counts.items():
             pretoken_counts[token] = pretoken_counts.get(token, 0) + count
+    _log(f"Aggregated pretoken counts. Found {len(pretoken_counts)} unique pretokens.")
 
-    merges = _compute_bpe_merges(pretoken_counts, vocab, vocab_size-len(special_tokens)-256)
+    num_merges = vocab_size - len(special_tokens) - 256
+    _log(f"Starting BPE merges (total: {num_merges})...")
+    merges = _compute_bpe_merges(pretoken_counts, vocab, num_merges)
+    _log("BPE merges completed.")
 
     return vocab, merges
 

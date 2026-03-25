@@ -61,7 +61,9 @@ def _count_file_chunk(args: tuple) -> dict[str, int]:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
     if special_tokens:
-        pattern = "|".join(re.escape(t) for t in special_tokens)
+        # 按长度降序排序，确保匹配长词优先
+        sorted_specials = sorted(special_tokens, key=len, reverse=True)
+        pattern = "|".join(re.escape(t) for t in sorted_specials)
         sub_chunks = re.split(pattern, chunk)
     else:
         sub_chunks = [chunk]
