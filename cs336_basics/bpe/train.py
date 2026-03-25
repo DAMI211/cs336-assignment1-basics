@@ -45,25 +45,31 @@ def _compute_bpe_merges(
 
     merges: list[tuple[bytes, bytes]] = []
 
-    # 初始化序列
-    # 将每个 pretoken 拆成初始 bytes 序列（每个元素是单字节 bytes）
-    pretoken_sequences: list[tuple[list[bytes], int]] = []
-    for pretoken, count in pretoken_counts.items():
-        # 遍历每个字节整数 b，包装成单字节 bytes 对象
-        byte_seq = [bytes([b]) for b in pretoken.encode("utf-8")]
-        pretoken_sequences.append((byte_seq, count))
-
-    # 一次性初始化 pair_freq（后续增量维护，不再重建）
-    pair_freq: dict[tuple[bytes, bytes], int] = defaultdict(int)
-    for seq, count in pretoken_sequences:
-        for i in range(len(seq) - 1):
-            pair_freq[(seq[i], seq[i + 1])] += count
-
-    # 最大堆（负频次模拟），元素: (-freq, pair)
-    # 同频时堆按 pair 字典序最小弹出（确定性即可），O(log n)
-    heap: list = [_heap_entry(freq, pair) for pair, freq in pair_freq.items()]
+    # 1. 初始化数据结构
+    unique_pretokens = list(pretoken_counts.keys())
+    counts = [pretoken_counts[p] for p in unique_pretokens]
+    
+    # word_sequences[word_idx] = list of token_bytes
+    word_sequences = []
+    for p in unique_pretokens:
+        word_sequences.append([bytes([b]) for b in p.encode("utf-8")])
+        
+    pair_freq = defaultdict(int)
+    # pair_to_word_indices: dict[pair, set[word_idx]]
+    # 记录每个 pair 出现在哪些唯一的预分词索引中
+    pair_to_word_indices = defaultdict(set)
+    
+    for i, seq in enumerate(word_sequences):
+        count = counts[i]
+        for j in range(len(seq) - 1):
+            pair = (seq[j], seq[j+1])
+            pair_freq[pair] += count
+            pair_to_word_indices[pair].add(i)
+            
+    # 最大堆（负频次模拟），元素: (-freq, _RevBytes(p1), _RevBytes(p2), pair)
+    heap = [_heap_entry(freq, pair) for pair, freq in pair_freq.items() if freq > 0]
     heapq.heapify(heap)
-
+    
     # pair_freq  →  权威数据源（始终是最新频次）
     # heap       →  加速查找用的索引（可能有过期条目）
     for i in range(merge_times):
@@ -85,50 +91,52 @@ def _compute_bpe_merges(
         new_token = best_pair[0] + best_pair[1]
         vocab[max(vocab) + 1] = new_token
 
-        # 增量更新：只扫描可能包含 best_pair 的序列
-        new_sequences: list[tuple[list[bytes], int]] = []
-        for seq, count in pretoken_sequences:
-            # 快速跳过不含左token的序列
-            if best_pair[0] not in seq:
-                new_sequences.append((seq, count))
-                continue
-
-            new_seq: list[bytes] = []
-            i = 0
-            while i < len(seq):
-                if (
-                    i < len(seq) - 1
-                    and seq[i] == best_pair[0]
-                    and seq[i + 1] == best_pair[1]
-                ):
-                    # 更新左邻居：(left, a) → (left, ab)
-                    if new_seq:
-                        left = new_seq[-1]
-                        pair_freq[(left, best_pair[0])] -= count
-                        pair_freq[(left, new_token)] += count
-                        heapq.heappush(heap, _heap_entry(pair_freq[(left, new_token)], (left, new_token)))
-                        # 当减少某个 pair 的频次时，必须推入新的记录，否则堆里只有旧的（过高的）频次。
-                        # lazy deletion 会丢弃旧条目，但新的正确频次从未入堆，这个 pair 就永远消失
-                        heapq.heappush(heap, _heap_entry(pair_freq[(left, best_pair[0])], (left, best_pair[0]))) 
-
-                    # 更新右邻居：(b, right) → (ab, right)
-                    if i + 2 < len(seq):
-                        right = seq[i + 2]
-                        pair_freq[(best_pair[1], right)] -= count
-                        pair_freq[(new_token, right)] += count
-                        heapq.heappush(heap, _heap_entry(pair_freq[(new_token, right)], (new_token, right)))
-                        heapq.heappush(heap, _heap_entry(pair_freq[(best_pair[1], right)], (best_pair[1], right)))  
-
+        # 仅处理包含 best_pair 的预分词序列
+        affected_indices = pair_to_word_indices[best_pair]
+        changed_pairs = set()
+        
+        # 必须遍历索引集的副本，因为在循环中会修改 pair_to_word_indices
+        for word_idx in list(affected_indices):
+            seq = word_sequences[word_idx]
+            count = counts[word_idx]
+            
+            # 1. 从全局频率和索引中移除该单词的所有旧 pair
+            for j in range(len(seq) - 1):
+                p = (seq[j], seq[j+1])
+                pair_freq[p] -= count
+                pair_to_word_indices[p].discard(word_idx)
+                changed_pairs.add(p)
+            
+            # 2. 执行合并，生成新序列
+            new_seq = []
+            j = 0
+            while j < len(seq):
+                if j < len(seq) - 1 and (seq[j], seq[j+1]) == best_pair:
                     new_seq.append(new_token)
-                    i += 2
+                    j += 2
                 else:
-                    new_seq.append(seq[i])
-                    i += 1
+                    new_seq.append(seq[j])
+                    j += 1
+            word_sequences[word_idx] = new_seq
+            
+            # 3. 将新序列的所有新 pair 添加到全局频率和索引中
+            for j in range(len(new_seq) - 1):
+                p = (new_seq[j], new_seq[j+1])
+                pair_freq[p] += count
+                pair_to_word_indices[p].add(word_idx)
+                changed_pairs.add(p)
 
-            new_sequences.append((new_seq, count))
-
-        del pair_freq[best_pair]
-        pretoken_sequences = new_sequences
+        # 更新堆：任何频率发生变化的 pair 都需要重新入堆
+        # lazy deletion 会处理掉旧的错误频次条目
+        for p in changed_pairs:
+            freq = pair_freq.get(p, 0)
+            if freq > 0:
+                heapq.heappush(heap, _heap_entry(freq, p))
+            elif p in pair_freq:
+                del pair_freq[p]
+            
+            if p in pair_to_word_indices and not pair_to_word_indices[p]:
+                del pair_to_word_indices[p]
 
     return merges
 
