@@ -13,6 +13,7 @@ from cs336_basics.bpe.train import train_bpe
 from cs336_basics.bpe.tokenizer import Tokenizer
 from cs336_basics.model.linear import Linear
 from cs336_basics.model.embedding import Embedding
+from cs336_basics.model.rmsnorm import RMSNorm
 
 
 def run_linear(
@@ -399,7 +400,12 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rmsnorm_model = RMSNorm(d_model, eps)
+    state_dict = {
+        "gain": weights
+    }
+    rmsnorm_model.load_state_dict(state_dict)
+    return rmsnorm_model.forward(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
